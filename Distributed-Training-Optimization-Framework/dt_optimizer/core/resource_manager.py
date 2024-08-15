@@ -1,194 +1,205 @@
 import os
-from typing import Tuple, Dict, List, Union, Any, Optional
+import psutil
+import logging
+from typing import Dict, Any, List, Optional
+from dataclasses import dataclass, field
 import threading
 import time
-import logging
-from collections import deque
-import psutil
-import GPUtil
+import numpy as np
+from abc import ABC, abstractmethod
 
-logging.basicConfig(level=logging.INFO)
+try:
+    import GPUtil
+    GPU_AVAILABLE = True
+except ImportError:
+    GPU_AVAILABLE = False
+
+try:
+    import boto3
+    AWS_AVAILABLE = True
+except ImportError:
+    AWS_AVAILABLE = False
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-class ResourceStatus:
-    def __init__(self, usage: float, allocation: Union[int, List[int]]):
-        self.usage: float = usage
-        self.allocation: Union[int, List[int]] = allocation
+@dataclass
+class ResourceMetrics:
+    cpu_usage: float
+    memory_usage: float
+    gpu_usage: float = 0.0
+    network_usage: float = 0.0
+    disk_usage: float = 0.0
 
-class CPUResource:
+@dataclass
+class ResourceAllocation:
+    cpus: int
+    memory: int
+    gpus: int = 0
+
+class CloudProvider(ABC):
+    @abstractmethod
+    def scale_up(self, resource_type: str, amount: int) -> bool:
+        pass
+
+    @abstractmethod
+    def scale_down(self, resource_type: str, amount: int) -> bool:
+        pass
+
+class AWSProvider(CloudProvider):
     def __init__(self):
-        self.count: int = psutil.cpu_count()
+        self.ec2 = boto3.client('ec2')
 
-    def get_usage(self) -> float:
-        return psutil.cpu_percent()
+    def scale_up(self, resource_type: str, amount: int) -> bool:
+        # Implement AWS-specific scaling logic
+        logger.info(f"Scaling up {amount} {resource_type} on AWS")
+        return True
 
-    def get_available(self) -> int:
-        return psutil.cpu_count(logical=False)
+    def scale_down(self, resource_type: str, amount: int) -> bool:
+        # Implement AWS-specific scaling logic
+        logger.info(f"Scaling down {amount} {resource_type} on AWS")
+        return True
 
-class MemoryResource:
-    def __init__(self):
-        self.total: int = psutil.virtual_memory().total
-
-    def get_usage(self) -> float:
-        return psutil.virtual_memory().percent
-
-    def get_available(self) -> int:
-        return psutil.virtual_memory().available
-
-class GPUResource:
-    def __init__(self):
-        self.gpus: List[GPUtil.GPU] = GPUtil.getGPUs()
-
-    def get_usage(self) -> float:
-        return max([gpu.memoryUtil for gpu in self.gpus]) if self.gpus else 0.0
-
-    def get_available(self) -> List[int]:
-        return [gpu.id for gpu in self.gpus if gpu.memoryUtil < 0.5]
-
-class ResourceHistory:
-    def __init__(self, history_size: int):
-        self.history: Dict[str, deque[float]] = {
-            'cpu': deque(maxlen=history_size),
-            'memory': deque(maxlen=history_size),
-            'gpu': deque(maxlen=history_size)
-        }
-
-    def add(self, resource_type: str, usage: float) -> None:
-        self.history[resource_type].append(usage)
-
-    def get_trend(self, resource_type: str) -> float:
-        history = self.history[resource_type]
-        if len(history) > 1:
-            return (history[-1] - history[0]) / len(history)
-        return 0.0
-
-class EnhancedResourceManager:
-    def __init__(self, monitoring_interval: int = 5, history_size: int = 100) -> None:
-        self.cpu: CPUResource = CPUResource()
-        self.memory: MemoryResource = MemoryResource()
-        self.gpu: GPUResource = GPUResource()
-        self.monitoring_interval: int = monitoring_interval
-        self.stop_monitoring_flag: threading.Event = threading.Event()
-        self.resource_history: ResourceHistory = ResourceHistory(history_size)
+class ResourceManager:
+    def __init__(self, cloud_provider: Optional[CloudProvider] = None) -> None:
+        self.cpu_count: int = psutil.cpu_count()
+        self.total_memory: int = psutil.virtual_memory().total
+        self.cloud_provider = cloud_provider
+        self.resource_history: List[ResourceMetrics] = []
+        self.allocation_history: List[ResourceAllocation] = []
         self.monitoring_thread: Optional[threading.Thread] = None
+        self.stop_monitoring = threading.Event()
 
-    def allocate_resources(self) -> Dict[str, Union[int, List[int]]]:
-        allocation = {
-            'cpu': self.cpu.get_available(),
-            'memory': self.memory.get_available(),
-            'gpu': self.gpu.get_available()
-        }
-        logger.info(f"Allocating {allocation['cpu']} CPUs, {allocation['memory'] // (1024 ** 3)} GB RAM, "
-                    f"and GPUs: {allocation['gpu']}")
-        return allocation
-
-    def monitor_resources(self) -> Dict[str, float]:
-        usage = {
-            'cpu': self.cpu.get_usage(),
-            'memory': self.memory.get_usage(),
-            'gpu': self.gpu.get_usage()
-        }
-        logger.info(f"CPU Usage: {usage['cpu']:.2f}% | Memory Usage: {usage['memory']:.2f}% | "
-                    f"GPU Usage: {usage['gpu']:.2f}%")
-        for resource_type, resource_usage in usage.items():
-            self.resource_history.add(resource_type, resource_usage)
-        return usage
-
-    def optimize_allocation(self, load_factors: Dict[str, float]) -> Dict[str, Any]:
-        optimizations: Dict[str, Any] = {}
-        for resource, load in load_factors.items():
-            if load > 0.8:
-                logger.warning(f"High {resource} load detected ({load:.2f}), increasing allocation")
-                optimizations[resource] = self._increase_allocation(resource)
-            elif load < 0.2:
-                logger.info(f"Low {resource} load detected ({load:.2f}), decreasing allocation")
-                optimizations[resource] = self._decrease_allocation(resource)
-            else:
-                logger.info(f"{resource.capitalize()} load within acceptable range ({load:.2f})")
-        return optimizations
-
-    def _increase_allocation(self, resource: str) -> Union[int, List[int]]:
-        if resource == 'cpu':
-            return min(self.cpu.count, self.cpu.get_available() + 2)
-        elif resource == 'memory':
-            return min(self.memory.total, int(self.memory.get_available() * 1.2))
-        elif resource == 'gpu':
-            return [gpu.id for gpu in self.gpu.gpus if gpu.memoryUtil < 0.8]
-        else:
-            raise ValueError(f"Unknown resource type: {resource}")
-
-    def _decrease_allocation(self, resource: str) -> Union[int, List[int]]:
-        if resource == 'cpu':
-            return max(1, self.cpu.get_available() - 1)
-        elif resource == 'memory':
-            return max(1024**3, int(self.memory.get_available() * 0.8))  # Ensure at least 1GB
-        elif resource == 'gpu':
-            return [gpu.id for gpu in self.gpu.gpus if gpu.memoryUtil < 0.2]
-        else:
-            raise ValueError(f"Unknown resource type: {resource}")
-
-    def start_monitoring(self) -> None:
-        def monitoring_task() -> None:
-            while not self.stop_monitoring_flag.is_set():
+    def start_monitoring(self, interval: int = 5) -> None:
+        def monitor_task():
+            while not self.stop_monitoring.is_set():
                 self.monitor_resources()
-                time.sleep(self.monitoring_interval)
+                time.sleep(interval)
 
-        self.monitoring_thread = threading.Thread(target=monitoring_task)
+        self.monitoring_thread = threading.Thread(target=monitor_task)
         self.monitoring_thread.start()
 
     def stop_monitoring(self) -> None:
-        if self.monitoring_thread is not None:
-            self.stop_monitoring_flag.set()
+        self.stop_monitoring.set()
+        if self.monitoring_thread:
             self.monitoring_thread.join()
-            self.monitoring_thread = None
+
+    def allocate_resources(self) -> ResourceAllocation:
+        available_cpus = psutil.cpu_count(logical=False)
+        available_memory = psutil.virtual_memory().available
+        available_gpus = len(GPUtil.getGPUs()) if GPU_AVAILABLE else 0
+
+        allocation = ResourceAllocation(cpus=available_cpus, memory=available_memory, gpus=available_gpus)
+        self.allocation_history.append(allocation)
+
+        logger.info(f"Allocating {allocation.cpus} CPUs, {allocation.memory // (1024 ** 3)} GB RAM, and {allocation.gpus} GPUs")
+        return allocation
+
+    def monitor_resources(self) -> ResourceMetrics:
+        cpu_usage = psutil.cpu_percent()
+        memory_usage = psutil.virtual_memory().percent
+        gpu_usage = self._get_gpu_usage()
+        network_usage = self._get_network_usage()
+        disk_usage = psutil.disk_usage('/').percent
+
+        metrics = ResourceMetrics(
+            cpu_usage=cpu_usage,
+            memory_usage=memory_usage,
+            gpu_usage=gpu_usage,
+            network_usage=network_usage,
+            disk_usage=disk_usage
+        )
+        self.resource_history.append(metrics)
+
+        logger.info(f"CPU: {cpu_usage:.2f}% | Memory: {memory_usage:.2f}% | GPU: {gpu_usage:.2f}% | "
+                    f"Network: {network_usage:.2f}Mbps | Disk: {disk_usage:.2f}%")
+        return metrics
+
+    def optimize_allocation(self, prediction_window: int = 5) -> None:
+        if len(self.resource_history) < prediction_window:
+            logger.warning("Not enough history for prediction. Skipping optimization.")
+            return
+
+        predicted_usage = self._predict_resource_usage(prediction_window)
+        current_allocation = self.allocation_history[-1]
+
+        if predicted_usage.cpu_usage > 80 or predicted_usage.memory_usage > 80:
+            self._scale_up(current_allocation)
+        elif predicted_usage.cpu_usage < 20 and predicted_usage.memory_usage < 20:
+            self._scale_down(current_allocation)
         else:
-            logger.warning("Monitoring thread is not running.")
+            logger.info("Resource usage within acceptable range. No changes needed.")
+
+    def _predict_resource_usage(self, window: int) -> ResourceMetrics:
+        recent_history = self.resource_history[-window:]
+        cpu_trend = np.polyfit(range(window), [m.cpu_usage for m in recent_history], 1)[0]
+        memory_trend = np.polyfit(range(window), [m.memory_usage for m in recent_history], 1)[0]
+
+        last_metrics = recent_history[-1]
+        predicted_cpu = min(100, max(0, last_metrics.cpu_usage + cpu_trend * window))
+        predicted_memory = min(100, max(0, last_metrics.memory_usage + memory_trend * window))
+
+        return ResourceMetrics(cpu_usage=predicted_cpu, memory_usage=predicted_memory)
+
+    def _scale_up(self, current_allocation: ResourceAllocation) -> None:
+        if self.cloud_provider:
+            if self.cloud_provider.scale_up('cpu', 1):
+                current_allocation.cpus += 1
+            if self.cloud_provider.scale_up('memory', 1024 ** 3):  # 1 GB
+                current_allocation.memory += 1024 ** 3
+        else:
+            logger.warning("No cloud provider available for scaling up.")
+
+    def _scale_down(self, current_allocation: ResourceAllocation) -> None:
+        if self.cloud_provider:
+            if current_allocation.cpus > 1 and self.cloud_provider.scale_down('cpu', 1):
+                current_allocation.cpus -= 1
+            if current_allocation.memory > 2 * (1024 ** 3) and self.cloud_provider.scale_down('memory', 1024 ** 3):
+                current_allocation.memory -= 1024 ** 3
+        else:
+            logger.warning("No cloud provider available for scaling down.")
+
+    def _get_gpu_usage(self) -> float:
+        if GPU_AVAILABLE:
+            gpus = GPUtil.getGPUs()
+            return sum(gpu.load for gpu in gpus) / len(gpus) * 100 if gpus else 0.0
+        return 0.0
+
+    def _get_network_usage(self) -> float:
+        net_io = psutil.net_io_counters()
+        return (net_io.bytes_sent + net_io.bytes_recv) / (1024 * 1024)  # Convert to Mbps
 
     def get_resource_trends(self) -> Dict[str, float]:
+        if len(self.resource_history) < 2:
+            return {}
+
+        last_metrics = self.resource_history[-1]
+        first_metrics = self.resource_history[0]
+        time_diff = len(self.resource_history) - 1
+
         return {
-            'cpu': self.resource_history.get_trend('cpu'),
-            'memory': self.resource_history.get_trend('memory'),
-            'gpu': self.resource_history.get_trend('gpu')
+            "cpu_trend": (last_metrics.cpu_usage - first_metrics.cpu_usage) / time_diff,
+            "memory_trend": (last_metrics.memory_usage - first_metrics.memory_usage) / time_diff,
+            "gpu_trend": (last_metrics.gpu_usage - first_metrics.gpu_usage) / time_diff,
+            "network_trend": (last_metrics.network_usage - first_metrics.network_usage) / time_diff,
+            "disk_trend": (last_metrics.disk_usage - first_metrics.disk_usage) / time_diff
         }
-
-    def suggest_scaling_strategy(self) -> str:
-        trends = self.get_resource_trends()
-        cpu_trend, memory_trend, gpu_trend = trends['cpu'], trends['memory'], trends['gpu']
-
-        if cpu_trend > 0.5 and memory_trend > 0.5:
-            return "Consider scaling out (adding more nodes)"
-        elif gpu_trend > 0.5:
-            return "Consider adding more GPUs or using more powerful GPUs"
-        elif cpu_trend > 0.5:
-            return "Consider using CPUs with more cores"
-        elif memory_trend > 0.5:
-            return "Consider adding more RAM"
-        else:
-            return "Current resource allocation seems sufficient"
 
 # Example usage
 if __name__ == "__main__":
-    resource_manager = EnhancedResourceManager()
+    cloud_provider = AWSProvider() if AWS_AVAILABLE else None
+    resource_manager = ResourceManager(cloud_provider)
 
     try:
-        initial_allocation = resource_manager.allocate_resources()
-        print(f"Initial allocation: {initial_allocation}")
+        resource_manager.start_monitoring(interval=2)
 
-        resource_manager.start_monitoring()
-        time.sleep(30)  # Simulate some work
-
-        current_usage = resource_manager.monitor_resources()
-        optimizations = resource_manager.optimize_allocation(current_usage)
-        print(f"Suggested optimizations: {optimizations}")
+        for _ in range(10):
+            allocation = resource_manager.allocate_resources()
+            resource_manager.optimize_allocation()
+            time.sleep(5)
 
         trends = resource_manager.get_resource_trends()
-        print(f"Resource trends: {trends}")
-
-        scaling_suggestion = resource_manager.suggest_scaling_strategy()
-        print(f"Scaling suggestion: {scaling_suggestion}")
-
-    except Exception as e:
-        logger.error(f"An error occurred: {str(e)}")
+        logger.info(f"Resource trends: {trends}")
 
     finally:
         resource_manager.stop_monitoring()
