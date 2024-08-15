@@ -1,126 +1,148 @@
 import torch
 import torch.nn as nn
-from typing import List, Optional, Dict, Any
-import logging
-from abc import ABC, abstractmethod
+from typing import List, Optional, Union, Dict
 from torch.nn.parallel import DistributedDataParallel
-from torch.distributed import init_process_group, destroy_process_group
-import os
+import torch.distributed as dist
+from torch.nn.parallel import pipeline_parallel_split
+import logging
 
-# Set up logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-class AdvancedModelParallelism:
-    def __init__(self, model: nn.Module, devices: List[int], split_size: int = 1):
+class ParallelismStrategy:
+    def __init__(self, model: nn.Module, pipeline_chunks: int = 1, balance: List[float] = None) -> None:
         self.model = model
-        self.devices = devices
-        self.split_size = split_size
-        self.distributed = len(devices) > 1
+        self.pipeline_chunks = pipeline_chunks
+        self.balance = balance
 
-    def _split_model(self):
+    def apply(self, device_ids: Optional[List[int]] = None) -> nn.Module:
+        if device_ids is None:
+            device_ids = list(range(torch.cuda.device_count()))
+        return self._apply_parallelism(device_ids)
+
+    def _apply_parallelism(self, device_ids: List[int]) -> nn.Module:
+        raise NotImplementedError("This method should be implemented by subclasses")
+
+class DataParallelism(ParallelismStrategy):
+    def _apply_parallelism(self, device_ids: List[int]) -> nn.Module:
+        logger.info(f"Applying Data Parallelism on devices: {device_ids}")
+        if not dist.is_initialized():
+            dist.init_process_group(backend='nccl')
+        return DistributedDataParallel(self.model.to(device_ids[0]), device_ids=device_ids)
+
+class ModelParallelism(ParallelismStrategy):
+    def _apply_parallelism(self, device_ids: List[int]) -> nn.Module:
+        logger.info(f"Applying Model Parallelism on devices: {device_ids}")
         layers = list(self.model.children())
-        split_layers = [layers[i:i+self.split_size] for i in range(0, len(layers), self.split_size)]
-        return [nn.Sequential(*split) for split in split_layers]
+        if self.balance:
+            assert len(self.balance) == len(device_ids), "Balance must match number of devices"
+            cumsum = torch.cumsum(torch.tensor(self.balance), 0)
+            device_assignment = torch.bucketize(torch.linspace(0, 1, len(layers)), cumsum)
+        else:
+            device_assignment = torch.tensor([i % len(device_ids) for i in range(len(layers))])
 
-    def _distribute_model(self):
-        splits = self._split_model()
-        distributed_model = []
-        for i, split in enumerate(splits):
-            device = self.devices[i % len(self.devices)]
-            distributed_model.append(split.to(f'cuda:{device}'))
-        return distributed_model
-
-    def _setup_distributed(self):
-        os.environ['MASTER_ADDR'] = 'localhost'
-        os.environ['MASTER_PORT'] = '12355'
-        init_process_group(backend='nccl', rank=0, world_size=1)
-
-    def apply(self) -> nn.Module:
-        if self.distributed:
-            self._setup_distributed()
-
-        distributed_model = self._distribute_model()
-
-        class DistributedSequential(nn.Module):
-            def __init__(self, modules):
+        for i, layer in enumerate(layers):
+            layer.to(f'cuda:{device_ids[device_assignment[i]]}')
+        
+        class ModelParallelSequential(nn.Module):
+            def __init__(self, layers):
                 super().__init__()
-                self.modules = nn.ModuleList(modules)
-
+                self.layers = nn.ModuleList(layers)
+            
             def forward(self, x):
-                for module in self.modules:
-                    x = module(x.to(next(module.parameters()).device))
+                for layer in self.layers:
+                    x = layer(x.to(next(layer.parameters()).device))
                 return x
+        
+        return ModelParallelSequential(layers)
 
-        model = DistributedSequential(distributed_model)
+class PipelineParallelism(ParallelismStrategy):
+    def _apply_parallelism(self, device_ids: List[int]) -> nn.Module:
+        logger.info(f"Applying Pipeline Parallelism on devices: {device_ids}")
+        splits = pipeline_parallel_split(self.model, device_ids, self.pipeline_chunks, self.balance)
+        return PipelineParallelModule(splits, device_ids)
 
-        if self.distributed:
-            model = DistributedDataParallel(model, device_ids=self.devices)
+class HybridParallelism(ParallelismStrategy):
+    def _apply_parallelism(self, device_ids: List[int]) -> nn.Module:
+        logger.info(f"Applying Hybrid Parallelism on devices: {device_ids}")
+        model_parallel = ModelParallelism(self.model)._apply_parallelism(device_ids[:len(device_ids)//2])
+        return DataParallelism(model_parallel)._apply_parallelism([device_ids[len(device_ids)//2]])
 
-        logger.info(f"Applied Advanced Model Parallelism across devices: {self.devices}")
-        return model
+class PipelineParallelModule(nn.Module):
+    def __init__(self, splits: List[nn.Module], device_ids: List[int]):
+        super().__init__()
+        self.splits = nn.ModuleList([split.to(f'cuda:{device_ids[i]}') for i, split in enumerate(splits)])
+        self.device_ids = device_ids
 
-    def cleanup(self):
-        if self.distributed:
-            destroy_process_group()
+    def forward(self, x):
+        for i, split in enumerate(self.splits):
+            x = split(x.to(f'cuda:{self.device_ids[i]}'))
+        return x
 
-class ModelParallelismOptimizer:
+class ParallelismOrchestrator:
     def __init__(self, model: nn.Module):
         self.model = model
+        self.parallel_model = None
 
-    def optimize(self, config: Dict[str, Any]) -> nn.Module:
-        devices = config.get('devices', [0])
-        split_size = config.get('split_size', 1)
+    def parallelize(self, config: Dict[str, Union[str, List[int], int, List[float]]]) -> nn.Module:
+        parallel_type = config.get('type', 'data')
+        device_ids = config.get('device_ids', None)
+        pipeline_chunks = config.get('pipeline_chunks', 1)
+        balance = config.get('balance', None)
 
-        parallelism = AdvancedModelParallelism(self.model, devices, split_size)
-        optimized_model = parallelism.apply()
+        strategy_map = {
+            'data': DataParallelism,
+            'model': ModelParallelism,
+            'pipeline': PipelineParallelism,
+            'hybrid': HybridParallelism
+        }
 
-        return optimized_model
+        if parallel_type not in strategy_map:
+            raise ValueError(f"Unsupported parallelism type: {parallel_type}")
 
-# Integration with resource_manager.py
-from dt_optimizer.core.resource_manager import ResourceManager
+        strategy = strategy_map[parallel_type](self.model, pipeline_chunks, balance)
+        self.parallel_model = strategy.apply(device_ids)
+        return self.parallel_model
 
-class ResourceAwareModelParallelism(ModelParallelismOptimizer):
-    def __init__(self, model: nn.Module, resource_manager: ResourceManager):
-        super().__init__(model)
-        self.resource_manager = resource_manager
+    def get_parallel_model(self) -> Optional[nn.Module]:
+        return self.parallel_model
 
-    def optimize(self, config: Dict[str, Any]) -> nn.Module:
-        available_devices = self.resource_manager.get_available_devices()
-        config['devices'] = available_devices
-        return super().optimize(config)
-
-# Integration with fault_tolerance.py
-from dt_optimizer.core.fault_tolerance import FaultTolerance
-
-class FaultTolerantModelParallelism(ModelParallelismOptimizer):
-    def __init__(self, model: nn.Module, fault_tolerance: FaultTolerance):
-        super().__init__(model)
-        self.fault_tolerance = fault_tolerance
-
-    def optimize(self, config: Dict[str, Any]) -> nn.Module:
-        optimized_model = super().optimize(config)
-        return self.fault_tolerance.wrap_model(optimized_model)
-
-# Usage example
+# Example usage
 if __name__ == "__main__":
     model = nn.Sequential(
-        nn.Linear(1000, 1000),
+        nn.Linear(100, 100),
         nn.ReLU(),
-        nn.Linear(1000, 1000),
+        nn.Linear(100, 100),
         nn.ReLU(),
-        nn.Linear(1000, 10)
+        nn.Linear(100, 10)
     )
 
-    config = {
-        'devices': [0, 1, 2, 3],  # Assuming 4 GPUs
-        'split_size': 2
-    }
+    orchestrator = ParallelismOrchestrator(model)
 
-    optimizer = ModelParallelismOptimizer(model)
-    parallelized_model = optimizer.optimize(config)
+    # Data Parallelism
+    data_parallel_model = orchestrator.parallelize({
+        'type': 'data',
+        'device_ids': [0, 1, 2, 3]
+    })
 
-    # Example input
-    input_tensor = torch.randn(32, 1000).to('cuda:0')
-    output = parallelized_model(input_tensor)
-    print(f"Output shape: {output.shape}")
+    # Model Parallelism
+    model_parallel_model = orchestrator.parallelize({
+        'type': 'model',
+        'device_ids': [0, 1, 2, 3],
+        'balance': [0.3, 0.3, 0.2, 0.2]  # Distribute model across GPUs with this balance
+    })
+
+    # Pipeline Parallelism
+    pipeline_parallel_model = orchestrator.parallelize({
+        'type': 'pipeline',
+        'device_ids': [0, 1, 2, 3],
+        'pipeline_chunks': 4
+    })
+
+    # Hybrid Parallelism
+    hybrid_parallel_model = orchestrator.parallelize({
+        'type': 'hybrid',
+        'device_ids': [0, 1, 2, 3]
+    })
+
+    print("Parallelism applied successfully!")
