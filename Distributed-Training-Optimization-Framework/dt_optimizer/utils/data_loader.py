@@ -10,6 +10,7 @@ from functools import partial
 import os
 import pickle
 from tqdm import tqdm
+import fickling
 
 class AdvancedDataLoaderManager:
     def __init__(self, 
@@ -101,7 +102,7 @@ class AdvancedDataLoaderManager:
 
             def __getitem__(self, index):
                 with open(os.path.join(self.cache_dir, f"item_{index}.pkl"), "rb") as f:
-                    return pickle.load(f)
+                    return fickling.load(f)
 
             def __len__(self):
                 return self.length
