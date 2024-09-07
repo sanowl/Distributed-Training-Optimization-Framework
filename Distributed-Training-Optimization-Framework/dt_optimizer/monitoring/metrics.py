@@ -56,7 +56,7 @@ class SlackAlertChannel(AlertChannel):
         payload = {
             "text": f"*{alert.level.name}*: {alert.name}\n{alert.message}"
         }
-        response = requests.post(self.webhook_url, json=payload)
+        response = requests.post(self.webhook_url, json=payload, timeout=60)
         if response.status_code != 200:
             logger.error(f"Failed to send Slack alert: {response.text}")
 
